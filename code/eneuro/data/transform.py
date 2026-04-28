@@ -1,7 +1,7 @@
 import numpy as np
 import cv2
 import random
-from .core import Tensor, as_Tensor, as_array
+from ..base import Tensor, as_Tensor, as_array
 
 def normalize(tensor: Tensor, mean, std) -> Tensor:
     #标准化: (x - mean) / std
