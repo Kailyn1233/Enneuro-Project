@@ -735,6 +735,8 @@ def col2im_array(col, img_shape, kernel_size, stride, pad, to_matrix=True, dilat
 #卷积函数和反卷积函数对称性强，大部分代码互为镜像
 class Conv2d(Function):
     WINOGRAD_MIN_INPUT_SHAPE = (12, 12, 256, 256)
+    FFT_MIN_KERNEL_SIZE = 5
+    FFT_MIN_SPATIAL_SIZE = 32
 
     def __init__(self, stride=(1,1), pad=(0,0), dilation=1, visualize=False):
         super().__init__()
@@ -757,7 +759,7 @@ class Conv2d(Function):
 
 
     def _select_forward_path(self, x, W):
-        """选择前向路径: winograd | gemm | im2col。"""
+        """选择前向路径: winograd | fft | gemm | im2col。"""
         if len(x.shape) != 4 or len(W.shape) != 4:
             return 'im2col'
 
@@ -771,6 +773,14 @@ class Conv2d(Function):
         # 3x3 stride=1 dilation=1 且大图优先 Winograd
         if KH == 3 and KW == 3 and SH == 1 and SW == 1 and DH == 1 and DW == 1 and is_large_input:
             return 'winograd'
+
+        # 大核卷积在较大空间尺寸上优先 FFT
+        # 保持保守：只在非空洞卷积时启用，避免路径选择过早偏向 FFT
+        if DH == 1 and DW == 1:
+            is_fft_kernel = (KH if KH >= KW else KW) >= self.FFT_MIN_KERNEL_SIZE
+            is_fft_input = H >= self.FFT_MIN_SPATIAL_SIZE and W_in >= self.FFT_MIN_SPATIAL_SIZE
+            if is_fft_kernel and is_fft_input:
+                return 'fft'
 
         # 大图但不满足 Winograd 条件时：
         # 细长核(如 1x1 / 1x3 / 3x1)实测 im2col 更快，其余优先 GEMM
@@ -789,15 +799,23 @@ class Conv2d(Function):
         b = xs[2]
         self._fw_workspace = None
         self._fw_workspace_version = None
+        self._used_fft = False
+        # 暂时禁用路径选择，强制使用 im2col 路径
         path = self._select_forward_path(x, W)
         self._used_winograd = (path == 'winograd')
         if path == 'winograd':
             return self.winograd_conv2d_forward(x, W, b)
+        elif path == 'fft':
+            self._used_winograd = False
+            self._used_fft = True
+            return self.fft_conv2d_forward(x, W, b)
         elif path == 'gemm':
             self._used_winograd = False
+            self._used_fft = False
             return self.gemm_conv2d_forward(x, W, b)
         else:
             self._used_winograd = False
+            self._used_fft = False
             # 回退到原本基于 im2col + tensordot 的标准卷积
             return self.im2col_conv2d_forward(x, W, b)
 
@@ -1055,6 +1073,53 @@ class Conv2d(Function):
         y = xp.rollaxis(y, 3, 1)
         # y = np.transpose(y, (0, 3, 1, 2))
         return y
+
+    def fft_conv2d_forward(self, x, W, b):
+        """使用 FFT 实现卷积前向传播。"""
+        W_data = W.data if isinstance(W, Tensor) else W
+        xp = get_array_module(W_data)
+
+        x_data = to_xp(x, xp)
+        W_data = to_xp(W, xp)
+
+        if not isinstance(x_data, xp.ndarray):
+            x_data = xp.array(x_data)
+        if not isinstance(W_data, xp.ndarray):
+            W_data = xp.array(W_data)
+
+        SH, SW = self.stride
+        PH, PW = self.pad
+        if self.dilation != (1, 1):
+            return self.im2col_conv2d_forward(x, W, b)
+
+        N, C, H, W_in = x_data.shape
+        OC, _, KH, KW = W_data.shape
+
+        OH = get_conv_outsize(H, KH, SH, PH, 1)
+        OW = get_conv_outsize(W_in, KW, SW, PW, 1)
+        if OH <= 0 or OW <= 0:
+            return xp.zeros((N, OC, max(OH, 0), max(OW, 0)), dtype=x_data.dtype)
+
+        x_pad = xp.pad(x_data, ((0, 0), (0, 0), (PH, PH), (PW, PW)), mode='constant')
+        fft_h = x_pad.shape[2] + KH - 1
+        fft_w = x_pad.shape[3] + KW - 1
+
+        # FFT 对应的是卷积；当前实现是 cross-correlation，因此先翻转核。
+        W_flip = W_data[:, :, ::-1, ::-1]
+        x_freq = xp.fft.rfftn(x_pad, s=(fft_h, fft_w), axes=(2, 3))
+        w_freq = xp.fft.rfftn(W_flip, s=(fft_h, fft_w), axes=(2, 3))
+        y_freq = xp.einsum('nchw,ochw->nohw', x_freq, w_freq, optimize=True)
+        y_full = xp.fft.irfftn(y_freq, s=(fft_h, fft_w), axes=(2, 3))
+
+        h_start = KH - 1
+        w_start = KW - 1
+        y = y_full[:, :, h_start:h_start + OH * SH:SH, w_start:w_start + OW * SW:SW]
+
+        if b is not None:
+            b_data = to_xp(b, xp)
+            y += b_data.reshape(1, -1, 1, 1)
+
+        return y.astype(x_data.dtype, copy=False)
 
     def gemm_conv2d_forward(self, x, W, b):
         """
