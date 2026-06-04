@@ -1,4 +1,7 @@
 import weakref
+import time
+import os
+import math
 from .core import Tensor 
 from .core import as_Tensor, as_array
 from .core import Function
@@ -10,6 +13,47 @@ except ImportError:
     has_cupy = False
 
 from .core import Config
+import builtins
+
+
+_CPU_TILED_ENABLED = os.environ.get("ENE_CONV_CPU_TILED", "1") != "0"
+_CPU_TILED_MIN_OH_OW = int(os.environ.get("ENE_CONV_CPU_TILED_MIN_OH_OW", "4096"))
+_CPU_TILE_TARGET_BYTES = int(os.environ.get("ENE_CONV_CPU_TILE_TARGET_BYTES", "262144"))
+_CPU_IM2COL_TILE = (
+    int(os.environ.get("ENE_CONV_CPU_IM2COL_TILE_H", "32")),
+    int(os.environ.get("ENE_CONV_CPU_IM2COL_TILE_W", "32")),
+)
+_CPU_COL2IM_TILE = (
+    int(os.environ.get("ENE_CONV_CPU_COL2IM_TILE_H", "32")),
+    int(os.environ.get("ENE_CONV_CPU_COL2IM_TILE_W", "32")),
+)
+
+
+def _use_cpu_tiled_kernel(xp, oh, ow):
+    if not _CPU_TILED_ENABLED or xp is not np:
+        return False
+    return (oh * ow) >= _CPU_TILED_MIN_OH_OW
+
+
+def _select_cpu_tile_shape(n, c, kh, kw, oh, ow, itemsize, base_tile):
+    base_h = builtins.max(1, base_tile[0])
+    base_w = builtins.max(1, base_tile[1])
+    bytes_per_spatial_cell = builtins.max(1, n * c * kh * kw * itemsize)
+    budget_cells = builtins.max(1, _CPU_TILE_TARGET_BYTES // bytes_per_spatial_cell)
+    max_cells = builtins.max(1, builtins.min(base_h * base_w, budget_cells))
+
+    tile_h = builtins.min(base_h, oh, builtins.max(1, int(math.sqrt(max_cells))))
+    tile_w = builtins.min(base_w, ow, builtins.max(1, max_cells // tile_h))
+
+    while tile_h * tile_w > max_cells and tile_w > 1:
+        tile_w -= 1
+    while tile_h * tile_w > max_cells and tile_h > 1:
+        tile_h -= 1
+        tile_w = builtins.min(base_w, ow, builtins.max(1, max_cells // tile_h))
+        while tile_h * tile_w > max_cells and tile_w > 1:
+            tile_w -= 1
+
+    return tile_h, tile_w
 
 
 def get_array_module(arr):
@@ -685,12 +729,34 @@ def im2col_array(img, kernel_size, stride, pad, to_matrix=True, dilation=1, xp=N
                  ((0, 0), (0, 0), (PH, PH + SH - 1), (PW, PW + SW - 1)),
                  mode='constant', constant_values=(0,))
     col = xp.ndarray((N, C, KH, KW, OH, OW), dtype=img.dtype)
-    # 计算每个patch在输入图像中的位置，支持扩张卷积
-    for j in range(KH):
-        j_lim = j * DH + SH * OH
-        for i in range(KW):
-            i_lim = i * DW + SW * OW
-            col[:, :, j, i, :, :] = img[:, :, j*DH:j_lim:SH, i*DW:i_lim:SW]
+
+    use_tiled = _use_cpu_tiled_kernel(xp, OH, OW)
+    if use_tiled:
+        tile_h, tile_w = _select_cpu_tile_shape(
+            N, C, KH, KW, OH, OW, img.dtype.itemsize, _CPU_IM2COL_TILE
+        )
+        for oh0 in range(0, OH, tile_h):
+            oh1 = OH if (oh0 + tile_h) > OH else (oh0 + tile_h)
+            h_base = oh0 * SH
+            oh_span = oh1 - oh0
+            for ow0 in range(0, OW, tile_w):
+                ow1 = OW if (ow0 + tile_w) > OW else (ow0 + tile_w)
+                w_base = ow0 * SW
+                ow_span = ow1 - ow0
+                for j in range(KH):
+                    j_base = j * DH + h_base
+                    j_lim = j_base + SH * oh_span
+                    for i in range(KW):
+                        i_base = i * DW + w_base
+                        i_lim = i_base + SW * ow_span
+                        col[:, :, j, i, oh0:oh1, ow0:ow1] = img[:, :, j_base:j_lim:SH, i_base:i_lim:SW]
+    else:
+        # 计算每个patch在输入图像中的位置，支持扩张卷积
+        for j in range(KH):
+            j_lim = j * DH + SH * OH
+            for i in range(KW):
+                i_lim = i * DW + SW * OW
+                col[:, :, j, i, :, :] = img[:, :, j*DH:j_lim:SH, i*DW:i_lim:SW]
 
     if to_matrix:
         col = col.transpose((0, 4, 5, 1, 2, 3)).reshape((N * OH * OW, -1))
@@ -713,20 +779,41 @@ def col2im_array(col, img_shape, kernel_size, stride, pad, to_matrix=True, dilat
         
     xp = get_array_module(col)
     
-    img = xp.zeros((N, C, H + 2 * PH + SH - 1, W + 2 * PW + SW - 1),    
+    img = xp.zeros((N, C, H + 2 * PH + SH - 1, W + 2 * PW + SW - 1),
                    dtype=col.dtype)
-    #适合小图像处理
-    # for oh in range(OH):
-    #     for ow in range(OW):
-    #         # 考虑填充偏移
-    #         j_start = oh * SH
-    #         i_start = ow * SW
-    #         img[:, :, j_start:j_start+KH, i_start:i_start+KW] += col[:, :, :, :, oh, ow]
-    for j in range(KH):
-        j_lim = j * DH + SH * OH
-        for i in range(KW):
-            i_lim = i * DW + SW * OW
-            img[:, :, j*DH:j_lim:SH, i*DW:i_lim:SW] += col[:, :, j, i, :, :]
+    use_tiled = _use_cpu_tiled_kernel(xp, OH, OW)
+    if use_tiled:
+        tile_h, tile_w = _select_cpu_tile_shape(
+            N, C, KH, KW, OH, OW, col.dtype.itemsize, _CPU_COL2IM_TILE
+        )
+        for oh0 in range(0, OH, tile_h):
+            oh1 = OH if (oh0 + tile_h) > OH else (oh0 + tile_h)
+            h_base = oh0 * SH
+            oh_span = oh1 - oh0
+            for ow0 in range(0, OW, tile_w):
+                ow1 = OW if (ow0 + tile_w) > OW else (ow0 + tile_w)
+                w_base = ow0 * SW
+                ow_span = ow1 - ow0
+                for j in range(KH):
+                    j_base = j * DH + h_base
+                    j_lim = j_base + SH * oh_span
+                    for i in range(KW):
+                        i_base = i * DW + w_base
+                        i_lim = i_base + SW * ow_span
+                        img[:, :, j_base:j_lim:SH, i_base:i_lim:SW] += col[:, :, j, i, oh0:oh1, ow0:ow1]
+    else:
+        #适合小图像处理
+        # for oh in range(OH):
+        #     for ow in range(OW):
+        #         # 考虑填充偏移
+        #         j_start = oh * SH
+        #         i_start = ow * SW
+        #         img[:, :, j_start:j_start+KH, i_start:i_start+KW] += col[:, :, :, :, oh, ow]
+        for j in range(KH):
+            j_lim = j * DH + SH * OH
+            for i in range(KW):
+                i_lim = i * DW + SW * OW
+                img[:, :, j*DH:j_lim:SH, i*DW:i_lim:SW] += col[:, :, j, i, :, :]
     return img[:, :, PH:H + PH, PW:W + PW]
 
 
@@ -737,6 +824,10 @@ class Conv2d(Function):
     WINOGRAD_MIN_INPUT_SHAPE = (12, 12, 256, 256)
     FFT_MIN_KERNEL_SIZE = 5
     FFT_MIN_SPATIAL_SIZE = 32
+    AUTOTUNE_ENABLED = True
+    AUTOTUNE_TRAIN_ONLY = True
+    _path_cache = {}
+    _path_cache_max = 256
 
     def __init__(self, stride=(1,1), pad=(0,0), dilation=1, visualize=False):
         super().__init__()
@@ -792,6 +883,101 @@ class Conv2d(Function):
         # 其余场景回退到原始 im2col 路径
         return 'im2col'
 
+    def _path_cache_key(self, x, W):
+        W_data = W.data if isinstance(W, Tensor) else W
+        xp = get_array_module(W_data)
+        return (
+            x.shape,
+            W_data.shape,
+            self.stride,
+            self.pad,
+            self.dilation,
+            xp.__name__,
+        )
+
+    def _autotune_select_path(self, x, W, b):
+        default_path = self._select_forward_path(x, W)
+        if not self.AUTOTUNE_ENABLED:
+            return default_path
+        if self.AUTOTUNE_TRAIN_ONLY and not Config.train:
+            return default_path
+
+        W_data = W.data if isinstance(W, Tensor) else W
+        xp = get_array_module(W_data)
+        if xp is np:
+            return default_path
+
+        candidates = [default_path]
+
+        N, C, H, W_in = x.shape
+        _, _, KH, KW = W_data.shape
+        SH, SW = self.stride
+        DH, DW = self.dilation
+        min_n, min_c, min_h, min_w = self.WINOGRAD_MIN_INPUT_SHAPE
+        is_large_input = N >= min_n and C >= min_c and H >= min_h and W_in >= min_w
+
+        if KH == 3 and KW == 3 and SH == 1 and SW == 1 and DH == 1 and DW == 1 and is_large_input:
+            candidates.append('winograd')
+        if DH == 1 and DW == 1:
+            is_fft_kernel = (KH if KH >= KW else KW) >= self.FFT_MIN_KERNEL_SIZE
+            is_fft_input = H >= self.FFT_MIN_SPATIAL_SIZE and W_in >= self.FFT_MIN_SPATIAL_SIZE
+            if is_fft_kernel and is_fft_input and KH >= 7 and KW >= 7 and H >= 64 and W_in >= 64:
+                candidates.append('fft')
+        if is_large_input and not (KH == 1 or KW == 1):
+            candidates.append('gemm')
+
+        candidates = list(dict.fromkeys(candidates))
+        if len(candidates) == 1:
+            return default_path
+
+        def run_path(path):
+            if path == 'winograd':
+                return self.winograd_conv2d_forward(x, W, b)
+            if path == 'fft':
+                return self.fft_conv2d_forward(x, W, b)
+            if path == 'gemm':
+                return self.gemm_conv2d_forward(x, W, b)
+            return self.im2col_conv2d_forward(x, W, b)
+
+        def time_path(path):
+            if has_cupy:
+                cp.cuda.Stream.null.synchronize()
+            run_path(path)
+            if has_cupy:
+                cp.cuda.Stream.null.synchronize()
+            start = time.perf_counter()
+            run_path(path)
+            if has_cupy:
+                cp.cuda.Stream.null.synchronize()
+            end = time.perf_counter()
+            return end - start
+
+        best_path = default_path
+        best_time = None
+        for path in candidates:
+            try:
+                t = time_path(path)
+            except Exception:
+                continue
+            if best_time is None or t < best_time:
+                best_time = t
+                best_path = path
+
+        return best_path
+
+    def _get_forward_path(self, x, W, b):
+        cls = self.__class__
+        key = self._path_cache_key(x, W)
+        cached = cls._path_cache.get(key)
+        if cached is not None:
+            return cached
+
+        path = self._autotune_select_path(x, W, b)
+        cls._path_cache[key] = path
+        if len(cls._path_cache) > cls._path_cache_max:
+            cls._path_cache.pop(next(iter(cls._path_cache)))
+        return path
+
     def forward(self, *xs):
         x = xs[0]
         #print(f"x.dtype = {x.dtype}")
@@ -800,8 +986,7 @@ class Conv2d(Function):
         self._fw_workspace = None
         self._fw_workspace_version = None
         self._used_fft = False
-        # 暂时禁用路径选择，强制使用 im2col 路径
-        path = self._select_forward_path(x, W)
+        path = self._get_forward_path(x, W, b)
         self._used_winograd = (path == 'winograd')
         if path == 'winograd':
             return self.winograd_conv2d_forward(x, W, b)
@@ -1098,7 +1283,7 @@ class Conv2d(Function):
         OH = get_conv_outsize(H, KH, SH, PH, 1)
         OW = get_conv_outsize(W_in, KW, SW, PW, 1)
         if OH <= 0 or OW <= 0:
-            return xp.zeros((N, OC, max(OH, 0), max(OW, 0)), dtype=x_data.dtype)
+            return xp.zeros((N, OC, builtins.max(OH, 0), builtins.max(OW, 0)), dtype=x_data.dtype)
 
         x_pad = xp.pad(x_data, ((0, 0), (0, 0), (PH, PH), (PW, PW)), mode='constant')
         fft_h = x_pad.shape[2] + KH - 1
@@ -1106,10 +1291,15 @@ class Conv2d(Function):
 
         # FFT 对应的是卷积；当前实现是 cross-correlation，因此先翻转核。
         W_flip = W_data[:, :, ::-1, ::-1]
-        x_freq = xp.fft.rfftn(x_pad, s=(fft_h, fft_w), axes=(2, 3))
-        w_freq = xp.fft.rfftn(W_flip, s=(fft_h, fft_w), axes=(2, 3))
-        y_freq = xp.einsum('nchw,ochw->nohw', x_freq, w_freq, optimize=True)
-        y_full = xp.fft.irfftn(y_freq, s=(fft_h, fft_w), axes=(2, 3))
+        try:
+            x_freq = xp.fft.rfftn(x_pad, s=(fft_h, fft_w), axes=(2, 3))
+            w_freq = xp.fft.rfftn(W_flip, s=(fft_h, fft_w), axes=(2, 3))
+            y_freq = xp.einsum('nchw,ochw->nohw', x_freq, w_freq, optimize=True)
+            y_full = xp.fft.irfftn(y_freq, s=(fft_h, fft_w), axes=(2, 3))
+        except Exception as exc:
+            if has_cupy and isinstance(exc, cp.cuda.memory.OutOfMemoryError):
+                return self.im2col_conv2d_forward(x, W, b)
+            raise
 
         h_start = KH - 1
         w_start = KW - 1
@@ -1148,7 +1338,7 @@ class Conv2d(Function):
         if OH <= 0 or OW <= 0:
             oh = OH if OH > 0 else 0
             ow = OW if OW > 0 else 0
-            return xp.zeros((N, OC, oh, ow), dtype=x.dtype)
+            return xp.zeros((N, OC, builtins.max(oh, 0), builtins.max(ow, 0)), dtype=x.dtype)
 
         SH, SW = self.stride
         PH, PW = self.pad
@@ -1498,141 +1688,6 @@ class GroupedConv2d(Function):
                 to_matrix=False, dilation=self.dilation
             )
             gW_group = xp.tensordot(gy_group, col, ((0, 2, 3), (0, 4, 5)))
-            gW[oc0:oc1, :, :, :] = gW_group
-
-        gb = None
-        if b.data is not None:
-            gb = gy.sum(axis=(0, 2, 3))
-
-        return as_Tensor(gx), as_Tensor(gW), (as_Tensor(gb) if gb is not None else None)
-
-
-def grouped_conv2d(x, W, b=None, stride=(1,1), pad=(0,0), groups=1, dilation=1, visualize=False):
-    return GroupedConv2d(stride, pad, groups, dilation, visualize)(x, W, b)
-
-
-# 深度卷积（本质上是 groups == in_channels 的分组卷积）
-def depthwise_conv2d(x, W, b=None, stride=(1,1), pad=(0,0), dilation=1, visualize=False):
-    x = as_Tensor(x)
-    groups = x.shape[1]
-    return grouped_conv2d(x, W, b, stride=stride, pad=pad, groups=groups, dilation=dilation, visualize=visualize)
-
-
-def conv2d_backward_input_array(gy, W, stride=(1, 1), pad=(0, 0), dilation=(1, 1), out_h=None, out_w=None):
-    """计算卷积对输入 x 的梯度（支持 dilation）。
-
-    Args:
-        gy: 上游梯度，形状 (N, OC, OH, OW)
-        W: 卷积核，形状 (OC, C, KH, KW)
-    """
-    SH, SW = pair(stride)
-    PH, PW = pair(pad)
-    DH, DW = pair(dilation)
-
-    N, OC, OH, OW = gy.shape
-    OC_W, C, KH, KW = W.shape
-    assert OC == OC_W
-
-    if out_h is None or out_w is None:
-        out_h = SH * (OH - 1) - 2 * PH + DH * (KH - 1) + 1
-        out_w = SW * (OW - 1) - 2 * PW + DW * (KW - 1) + 1
-
-    xp = get_array_module(W)
-    gx_pad = xp.zeros((N, C, out_h + 2 * PH + SH - 1, out_w + 2 * PW + SW - 1), dtype=gy.dtype)
-
-    for kh in range(KH):
-        h_start = kh * DH
-        h_end = h_start + SH * OH
-        for kw in range(KW):
-            w_start = kw * DW
-            w_end = w_start + SW * OW
-
-            # (N, OC, OH, OW) x (OC, C) -> (N, OH, OW, C) -> (N, C, OH, OW)
-            contrib = xp.tensordot(gy, W[:, :, kh, kw], axes=(1, 0)).transpose(0, 3, 1, 2)
-            gx_pad[:, :, h_start:h_end:SH, w_start:w_end:SW] += contrib
-
-    return gx_pad[:, :, PH:PH + out_h, PW:PW + out_w]
-
-
-class GroupedConv2d(Function):
-    def __init__(self, stride=(1,1), pad=(0,0), groups=1, dilation=1, visualize=False):
-        super().__init__()
-        self.stride = pair(stride)
-        self.pad = pair(pad)
-        self.groups = groups
-        self.dilation = pair(dilation)
-        self.visualize = visualize
-
-    def forward(self, *xs):
-        x = xs[0]
-        W = xs[1]
-        b = xs[2]
-
-        N, C, H, W_in = x.shape
-        OC, C_per_group, KH, KW = W.shape
-
-        assert C % self.groups == 0, "Input channels must be divisible by groups"
-        assert OC % self.groups == 0, "Output channels must be divisible by groups"
-
-        OC_per_group = OC // self.groups
-        OH = get_conv_outsize(H, KH, self.stride[0], self.pad[0], self.dilation[0])
-        OW = get_conv_outsize(W_in, KW, self.stride[1], self.pad[1], self.dilation[1])
-        y = np.zeros((N, OC, OH, OW), dtype=x.dtype)
-
-        for i in range(self.groups):
-            x_group = x[:, i*C_per_group:(i+1)*C_per_group, :, :]
-            W_group = W[i*OC_per_group:(i+1)*OC_per_group, :, :, :]
-
-            col = im2col_array(
-                x_group, (KH, KW), self.stride, self.pad,
-                to_matrix=False, dilation=self.dilation
-            )
-            y_group = np.tensordot(col, W_group, ((1, 2, 3), (1, 2, 3)))
-            y_group = np.rollaxis(y_group, 3, 1)
-            y[:, i*OC_per_group:(i+1)*OC_per_group, :, :] = y_group
-
-        if b is not None:
-            y += b.reshape(1, -1, 1, 1)
-
-        return y
-
-    def backward(self, gys):
-        x, W, b = self.inputs
-        x_data = x.data
-        W_data = W.data
-        gy = gys.data
-
-        N, C, H, W_in = x_data.shape
-        OC, C_per_group, KH, KW = W_data.shape
-        OC_per_group = OC // self.groups
-
-        gx = np.zeros_like(x_data)
-        gW = np.zeros_like(W_data)
-
-        for i in range(self.groups):
-            c0, c1 = i * C_per_group, (i + 1) * C_per_group
-            oc0, oc1 = i * OC_per_group, (i + 1) * OC_per_group
-
-            x_group = x_data[:, c0:c1, :, :]
-            gy_group = gy[:, oc0:oc1, :, :]
-            W_group = W_data[oc0:oc1, :, :, :]
-
-            gx_group = conv2d_backward_input_array(
-                gy_group,
-                W_group,
-                stride=self.stride,
-                pad=self.pad,
-                dilation=self.dilation,
-                out_h=H,
-                out_w=W_in,
-            )
-            gx[:, c0:c1, :, :] += gx_group
-
-            col = im2col_array(
-                x_group, (KH, KW), self.stride, self.pad,
-                to_matrix=False, dilation=self.dilation
-            )
-            gW_group = np.tensordot(gy_group, col, ((0, 2, 3), (0, 4, 5)))
             gW[oc0:oc1, :, :, :] = gW_group
 
         gb = None

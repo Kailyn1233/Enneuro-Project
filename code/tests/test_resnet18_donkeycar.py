@@ -375,10 +375,10 @@ def main():
 
     parser = argparse.ArgumentParser(description='DonkeyCar图像转向角回归训练 (ResNet18)')
     parser.add_argument('--data-dir', type=str, default=r'D:\Enneuro\tests\testdata\data', help='数据目录，默认自动查找')
-    parser.add_argument('--epochs', type=int, default=1)
-    parser.add_argument('--batch-size', type=int, default=16)
+    parser.add_argument('--epochs', type=int, default=4)
+    parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--lr', type=float, default=0.001)
-    parser.add_argument('--image-size', type=int, default=64)
+    parser.add_argument('--image-size', type=int, default=256)
     parser.add_argument('--train-ratio', type=float, default=0.7)
     parser.add_argument('--val-ratio', type=float, default=0.15)
     parser.add_argument('--max-samples', type=int, default=0, help='限制样本量以快速启动训练，<=0表示全量')
