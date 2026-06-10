@@ -20,7 +20,7 @@ size = 32
 X = np.random.randn(2, 3, size, size).astype(np.float32)  # 2张3通道图像
 y = np.array([0, 5], dtype=np.int32)                   # 2个样本的标签，范围[0, 9]
 
-num_fuse = 100
+num_fuse = 10
 sequential_content = []
 for i in range(num_fuse):
     sequential_content.append(Conv2d(3,3,1,1))
@@ -222,13 +222,13 @@ def test_autocast_executor(epoch_num = 10, dtype = 'float16'):
     graph = model_to_graph(model, sample_input) # 转换为图
     #graph = graph_apply_fuse(graph) # 在混合精度之前应用融合算子
     graph = graph_apply_cast(graph, dtype='float16') # 应用混合精度的图
-    #graph.visualize('optimized_graph.dot') # 保存为.dot文件便于查看
+    graph.visualize('optimized_graph.dot') # 保存为.dot文件便于查看
     
     executor = graph_to_executor(graph) # 优化后的执行器
 
     # 创建损失函数和优化器
     loss_fn = CrossEntropyLoss()
-    optimizer = SGD(model.params(), lr=0.1)
+    optimizer = SGD(executor.params(), lr=0.1)
     # 动态损失缩放器
     scaler = GradScaler()
     
@@ -243,7 +243,7 @@ def test_autocast_executor(epoch_num = 10, dtype = 'float16'):
 
     toc = time.time()
     duration = toc - tic
-    #print(f"executor training complete in {duration:.4f}s  loss = {loss}")
+    print(f"autocast executor training complete in {duration:.4f}s")
     return duration
 
 def test_autocast_ao(epoch_num = 10, dtype = 'float16'):
@@ -334,8 +334,9 @@ def test_autocast():
 
 if __name__ == "__main__":
     #test_auto_fuse()
-    #test_autocast()
-
-    for i in range(100):
-        test_executor()
+    
+    test_normal()
+    test_executor()
+    test_autocast_executor()
+        
 

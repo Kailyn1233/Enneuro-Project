@@ -1,5 +1,10 @@
 __all__ = []
 
+"""
+from .quantize import QuantizeManager
+__all__.append('QuantizeManager')
+#"""
+
 from .cast import GradScaler, AutoCastManager
 __all__.append('GradScaler')
 __all__.append('AutoCastManager')

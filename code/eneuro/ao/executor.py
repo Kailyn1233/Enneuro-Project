@@ -23,6 +23,9 @@ class GraphExecutor:
                 else:
                     self.data_input_nodes.append(node)
 
+    def params(self) -> List[Parameter]:
+        return [node.true_obj for node in self.param_nodes]
+
     def forward(self, *inputs: Tensor) -> Union[Tensor, List[Tensor]]:
         """
         执行优化图的前向传播
