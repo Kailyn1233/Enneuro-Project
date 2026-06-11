@@ -2367,7 +2367,7 @@ class FusedConvBNReLU(Function):
 def fused_conv_bn_relu(x, W, b, gamma, beta, running_mean, running_var, stride=1, pad=0, dilation=1, momentum=0.9, eps=1e-5, visualize=False):
     return FusedConvBNReLU(stride, pad, dilation, running_mean, running_var, momentum, eps, visualize)(x, W, b, gamma, beta)
 
-class CastRigistry:
+class CastRegistry:
     '''
     注册自动精度
     resist_cast: 从Config.current_dtype提高到float32
@@ -2399,6 +2399,26 @@ class CastRigistry:
         FusedConvBNReLU
     ]
 
+def type_precedence(dtype):
+    order = {'b':0, 'i':1, 'u':2, 'f':3, 'c':4}
+    return (order[dtype.kind], dtype.itemsize)
+
+def compare_dtype_greater(dtype1, dtype2):
+    if isinstance(dtype1, str):
+        dtype1 = np.dtype(dtype1)
+    if isinstance(dtype2, str):
+        dtype2 = np.dtype(dtype2)
+        
+    return True if type_precedence(dtype1) > type_precedence(dtype2) else False
+
+def compare_dtype_equal(dtype1, dtype2):
+    if isinstance(dtype1, str):
+        dtype1 = np.dtype(dtype1)
+    if isinstance(dtype2, str):
+        dtype2 = np.dtype(dtype2)
+
+    return True if type_precedence(dtype1) == type_precedence(dtype2) else False
+
 class Cast(Function):
     def __init__(self, dtype='float16'):
         super().__init__()
@@ -2408,8 +2428,8 @@ class Cast(Function):
         if len(xs) > 1:
             raise ValueError("Cast function only supports single input.")
         x = xs[0]
-        # 降低精度
-        x = x.astype(self.dtype) if x.dtype != self.dtype else x
+        # 改变精度
+        x = x.astype(self.dtype) if not compare_dtype_equal(x.dtype, self.dtype) else x
         return x
 
     def backward(self, gys):
@@ -2418,21 +2438,171 @@ class Cast(Function):
 def cast(x):
     return Cast()(x)
 
-class DeCast(Function):
+
+class DownCast(Function):
     def __init__(self, dtype='float16'):
         super().__init__()
         self.dtype = dtype
 
     def forward(self, *xs):
         if len(xs) > 1:
-            raise ValueError("DeCast function only supports single input.")
+            raise ValueError("DownCast function only supports single input.")
         x = xs[0]
-        # 提高精度
-        x = x.astype('float32') if x.dtype == self.dtype else x 
+        # 降低精度
+        x = x.astype(self.dtype) if compare_dtype_greater(x.dtype, self.dtype) else x
         return x
 
     def backward(self, gys):
         return gys
 
-def decast(x):
-    return DeCast()(x)
+def downcast(x):
+    return DownCast()(x)
+
+class UpCast(Function):
+    def __init__(self, dtype='float32'):
+        super().__init__()
+        self.dtype = dtype
+
+    def forward(self, *xs):
+        if len(xs) > 1:
+            raise ValueError("UpCast function only supports single input.")
+        x = xs[0]
+        # 提高精度
+        x = x.astype(self.dtype) if compare_dtype_greater(self.dtype, x.dtype) else x 
+        return x
+
+    def backward(self, gys):
+        return gys
+
+def upcast(x):
+    return UpCast()(x)
+
+def get_qmin_qmax(dtype):
+    if type(dtype) == str and dtype.startswith('int'):
+        num_bits = int(dtype[3:])
+        qmin = -(2 ** (num_bits - 1))
+        qmax = 2 ** (num_bits - 1) - 1
+    elif type(dtype) == str and dtype.startswith('uint'):
+        num_bits = int(dtype[4:])
+        qmin = 0
+        qmax = 2 ** num_bits - 1
+    elif isinstance(dtype, np.dtype):
+        qmin = np.iinfo(dtype).min
+        qmax = np.iinfo(dtype).max
+    elif has_cupy and isinstance(dtype, cp.dtype):
+        qmin = cp.iinfo(dtype).min
+        qmax = cp.iinfo(dtype).max
+    else:
+        raise ValueError(f"Unsupported dtype for quantization: {dtype}")
+    return qmin, qmax
+
+class FakeQuantize(Function):
+    def __init__(self, dtype='int8', gamma=0.9):
+        super().__init__()
+        self.dtype = dtype
+        self.qmin, self.qmax = get_qmin_qmax(dtype)
+        self.gamma = gamma
+
+        self.scale = None
+        self.zero_point = None
+        self.alpha = None
+        self.beta = None
+
+    def forward(self, *xs):
+        x = xs[0]
+        xp = get_array_module(x)
+        
+        # 计算输入的最小值和最大值
+        x_min = x.min()
+        x_max = x.max()
+        # 更新alpha和beta
+        if self.alpha is None:
+            self.alpha = x_min
+        else:
+            self.alpha = self.gamma * self.alpha + (1 - self.gamma) * x_min
+
+        if self.beta is None:
+            self.beta = x_max
+        else:
+            self.beta = self.gamma * self.beta + (1 - self.gamma) * x_max
+        
+        # 计算缩放因子
+        self.scale = (self.beta - self.alpha) / (self.qmax - self.qmin) if self.beta > self.alpha else 1.0
+        self.zero_point = xp.round(-self.alpha / self.scale).clip(self.qmin, self.qmax) if self.scale > 0 else 0
+
+        # 量化并反量化
+        q_x = xp.round(x / self.scale + self.zero_point).clip(self.qmin, self.qmax) if self.scale > 0 else x
+        fq_x = (q_x - self.zero_point) * self.scale if self.scale > 0 else x
+        return fq_x
+
+    def backward(self, gys):
+        # Straight-Through Estimator: 梯度直接传递，不考虑量化误差
+        return gys
+    
+def fake_quantize(x, dtype='int8'):
+    return FakeQuantize(dtype=dtype)(x)
+
+class FakeDequantize(Function):
+    def forward(self, *xs):
+        x = xs[0]
+        # 反量化：直接返回输入，保持与 FakeQuantize 的输出一致
+        return x
+
+    def backward(self, gys):
+        # Straight-Through Estimator: 梯度直接传递，不考虑量化误差
+        return gys
+    
+def fake_dequantize(x):
+    return FakeDequantize()(x)
+
+class QuantizeRegistry:
+    can_quantize = [
+        Conv2d,
+        GroupedConv2d,
+        Deconv2d,
+        MatMul,
+        Linear,
+        FusedConvReLU
+    ]
+
+class Quantize(Function):
+    def __init__(self, scale, zero_point, dtype='int8'):
+        super().__init__()
+        self.dtype = dtype
+        self.qmin, self.qmax = get_qmin_qmax(dtype)
+        self.scale = scale
+        self.zero_point = zero_point
+
+    def forward(self, *xs):
+        x = xs[0]
+        xp = get_array_module(x)
+
+        # 量化
+        q_x = xp.round(x / self.scale + self.zero_point).clip(self.qmin, self.qmax)
+        return q_x.astype(self.dtype)
+
+    def backward(self, gys):
+        # Straight-Through Estimator: 梯度直接传递，不考虑量化误差
+        return gys
+
+def quantize(x, scale, zero_point, dtype='int8'):
+    return Quantize(scale, zero_point, dtype=dtype)(x)
+
+class Dequantize(Function):
+    def __init__(self, scale, zero_point):
+        super().__init__()
+        self.scale = scale
+        self.zero_point = zero_point
+
+    def forward(self, *xs):
+        x = xs[0]
+        # 反量化
+        deq_x = (x.astype('float32') - self.zero_point) * self.scale
+        return deq_x
+
+    def backward(self, gys):
+        # Straight-Through Estimator: 梯度直接传递，不考虑量化误差
+        return gys
+
+def dequantize(x, scale, zero_point):
+    return Dequantize(scale, zero_point)(x)
