@@ -29,8 +29,10 @@ class Node:
         self.name = getattr(true_obj, 'name', None) or true_obj.__class__.__name__
         self.params = None
 
-        self.casted = False
-        self.decasted = False
+        self.dtype = getattr(true_obj, 'dtype', None)  # 仅 Tensor 有 dtype 属性
+
+        self.quantized = False
+        self.dequantized = False
 
     def __repr__(self):
         return f"Node(id={self.id}, type={self.type.name}, name={self.name})"
